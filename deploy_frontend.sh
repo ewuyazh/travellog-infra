@@ -9,14 +9,19 @@ REACT_APP_NAME="react-app"
 SPRINGBOOT_SERVICE="app"  # Spring Boot container name
 AWS_EC2_HOST="3.95.225.43"
 AWS_EC2_USER="ec2-user"   # Add this if it's missing
-SSH_KEY="./TravelAppKey.pem"
+SSH_KEY="$(cd "$(dirname "$0")" && pwd)/TravelAppKey.pem"
 DOCKER_NETWORK="travel-global-network"
 NGINX_CONF="nginx.production.conf"
-COMPOSE_FILE="docker-compose.production.yml"
+COMPOSE_FILE="docker-compose.yml"
 BUILD_CACHE_DIR="./.build-cache"
 GIT_HASH=$(git rev-parse --short HEAD)
+FRONTEND_DIR="../travellog-frontend"  # Adjust path to frontend
+INFRA_DIR="."  # Current directory is the infra folder
+DEPLOY_DIR="/home/ec2-user/"
 
 # ===== Validate Environment =====
+cd ${FRONTEND_DIR}
+
 if [ ! -f ".env.$DEPLOY_ENV" ]; then
   echo "ERROR: .env.$DEPLOY_ENV not found!"
   exit 1
@@ -31,10 +36,6 @@ fi
 echo "=== Building Production Image with Cache ==="
 mkdir -p "$BUILD_CACHE_DIR"
 docker buildx build \
-  -f Dockerfile.product \
-  --build-arg BUILDKIT_INLINE_CACHE=1 \
-  --cache-from type=local,src="$BUILD_CACHE_DIR" \
-  --cache-to type=local,dest="$BUILD_CACHE_DIR" \
   -t "$DOCKER_IMAGE_NAME:$APP_VERSION" \
   -t "$DOCKER_IMAGE_NAME:$APP_VERSION-$GIT_HASH" \
   .
@@ -44,9 +45,10 @@ DEPLOY_PACKAGE="deploy-$(date +%s).tar.gz"
 tar czf "$DEPLOY_PACKAGE" \
   "$COMPOSE_FILE" \
   .env.$DEPLOY_ENV \
-  Dockerfile.product
+  Dockerfile
 
 # ===== Secure Transfer to EC2 =====
+cd "$INFRA_DIR"  # Switch back to the infra directory
 echo "=== Transferring to EC2 ==="
 scp -i "$SSH_KEY" -o StrictHostKeyChecking=no \
   "$DEPLOY_PACKAGE" \
@@ -56,7 +58,6 @@ scp -i "$SSH_KEY" -o StrictHostKeyChecking=no \
 ssh -i "$SSH_KEY" -T "$AWS_EC2_USER@$AWS_EC2_HOST" << 'EOSSH'
 set -eo pipefail
 
-DEPLOY_DIR="/opt/travel-app"
 TIMESTAMP=$(date +%Y%m%d%H%M%S)
 CURRENT_DIR="$DEPLOY_DIR/$TIMESTAMP"
 DEPLOY_ENV="production"
