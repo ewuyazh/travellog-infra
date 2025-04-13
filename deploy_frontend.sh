@@ -7,17 +7,19 @@ APP_VERSION="1.0.0"
 DOCKER_IMAGE_NAME="travel-react-app"
 REACT_APP_NAME="react-app"
 SPRINGBOOT_SERVICE="app"  # Spring Boot container name
-AWS_EC2_HOST="3.95.225.43"
+GIT_HASH=$(git rev-parse --short HEAD)
+FRONTEND_DIR="../travellog-frontend"
+INFRA_DIR="."  # This script lives in infra repo
+
+AWS_EC2_HOST="3.87.242.127"
 AWS_EC2_USER="ec2-user"
 SSH_KEY="$(cd "$(dirname "$0")" && pwd)/TravelAppKey.pem"
 DOCKER_NETWORK="travel-global-network"
 NGINX_CONF="nginx.production.conf"
 COMPOSE_FILE="docker-compose.production.yml"
-GIT_HASH=$(git rev-parse --short HEAD)
-FRONTEND_DIR="../travellog-frontend"
-INFRA_DIR="."  # This script lives in infra repo
 
 cd "${FRONTEND_DIR}"
+
 # ===== Validate Environment =====
 if [ ! -f ".env.$DEPLOY_ENV" ]; then
   echo "ERROR: .env.$DEPLOY_ENV not found!"
@@ -29,23 +31,17 @@ if [ ! -f "$COMPOSE_FILE" ]; then
   exit 1
 fi
 
-# ===== Build  =====
-echo "=== Building Production Image  ==="
-docker buildx build \
-  -t "$DOCKER_IMAGE_NAME:$APP_VERSION" \
-  -t "$DOCKER_IMAGE_NAME:$APP_VERSION-$GIT_HASH" \
-  .
-
-DOCKER_IMAGE=$DOCKER_IMAGE_NAME:$APP_VERSION-$GIT_HASH
-docker save "$DOCKER_IMAGE" -o "$DOCKER_IMAGE.tar"
-
 # ===== Prepare Deployment Package =====
-DEPLOY_PACKAGE="deploy-$(date +%s).tar.gz"
+DEPLOY_PACKAGE="/tmp/deploy-$(date +%s).tar.gz"
 tar czf "$DEPLOY_PACKAGE" \
+  --exclude="$FRONTEND_DIR/node_modules" \
+  --exclude="$FRONTEND_DIR/.git" \
+  --exclude="$FRONTEND_DIR/*.log" \
+  --exclude="$FRONTEND_DIR/*.md" \
   "$COMPOSE_FILE" \
   ".env.$DEPLOY_ENV" \
   Dockerfile.production \
-  "$DOCKER_IMAGE.tar"
+  "$FRONTEND_DIR"  # Include the source code (React app)
 
 # ===== Clean old tarballs on EC2 =====
 echo "=== Cleaning up old tarballs on EC2 ==="
@@ -61,7 +57,8 @@ scp -i "$SSH_KEY" -o StrictHostKeyChecking=no \
   "$AWS_EC2_USER@$AWS_EC2_HOST:/tmp/"
 
 # ===== Remote Execution on EC2 =====
-ssh -i "$SSH_KEY" -T "$AWS_EC2_USER@$AWS_EC2_HOST" << 'EOSSH'
+ssh -i "$SSH_KEY" -T "$AWS_EC2_USER@$AWS_EC2_HOST" \
+  DEPLOY_PACKAGE="$DEPLOY_PACKAGE" DEPLOY_ENV="$DEPLOY_ENV" << 'EOSSH'
 set -eo pipefail
 
 DEPLOY_DIR="/home/ec2-user"
@@ -72,16 +69,26 @@ COMPOSE_FILE="docker-compose.production.yml"
 
 echo "=== Setting Up Deployment ==="
 mkdir -p "$CURRENT_DIR"
-tar xzf /tmp/deploy-*.tar.gz -C "$CURRENT_DIR"
+tar xzf /tmp/$DEPLOY_PACKAGE -C "$CURRENT_DIR"
 rm -f /tmp/deploy-*.tar.gz
 
 echo "=== Loading Environment ==="
 export \$(grep -v '^#' "$CURRENT_DIR/.env.$DEPLOY_ENV" | xargs)
 
-# Load the Docker image into Docker
-echo "=== Loading Docker Image ==="
-docker load < "$CURRENT_DIR/$DOCKER_IMAGE_NAME-$APP_VERSION.tar"
+# ===== Build React App and Docker Image on EC2 =====
+echo "=== Building React App and Docker Image on EC2 ==="
+cd "$CURRENT_DIR/$FRONTEND_DIR"
 
+# Ensure Dockerfile is present
+if [ ! -f Dockerfile.production ]; then
+  echo "ERROR: Dockerfile.production not found!"
+  exit 1
+fi
+
+# Build the Docker image on EC2
+docker build -t "$DOCKER_IMAGE_NAME:$APP_VERSION" -f Dockerfile.production .
+
+# ===== Network Setup =====
 echo "=== Network Setup ==="
 docker network inspect travel-global-network >/dev/null 2>&1 || \
   docker network create --driver bridge travel-global-network
@@ -111,15 +118,10 @@ echo "=== Current Services ==="
 docker-compose -f "$CURRENT_DIR/$COMPOSE_FILE" ps
 EOSSH
 
-
 # ===== Local Cleanup =====
 echo "=== Cleaning Up Locally ==="
 
-# Remove local Docker images (optional)
-docker rmi "$DOCKER_IMAGE" || echo "Images already removed or in use."
-
 # Remove deployment tarball
-rm -f "$FRONTEND_DIR/$DEPLOY_PACKAGE" || echo "Tarball already removed."
-rm -f "$FRONTEND_DIR/$DOCKER_IMAGE" || echo "Docker image already removed."
+rm -f "$INFRA_DIR/$DEPLOY_PACKAGE" || echo "Tarball already removed."
 
 echo "=== Local Cleanup Complete ==="
