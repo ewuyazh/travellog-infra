@@ -3,3 +3,5 @@ TravelAppKey.pem
 .env
 node_modules/
 cdk.out
+.venv/
+__pycache__/

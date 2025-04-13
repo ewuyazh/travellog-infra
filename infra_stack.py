@@ -11,14 +11,9 @@ class TravelAppInfraStack(Stack):
     def __init__(self, scope: Construct, id: str, **kwargs):
         super().__init__(scope, id, **kwargs)
 
-        # 1. Get your public IP for SSH access
-        try:
-            my_ip = requests.get('https://checkip.amazonaws.com').text.strip()
-            my_ip_cidr = f"{my_ip}/32"
-        except:
-            my_ip_cidr = "123.45.67.89/32"  # ← REPLACE WITH YOUR ACTUAL IP
+        key_name = "TravelAppKey"  # Define your EC2 key pair name here
 
-        # 2. Create VPC with public/private subnets
+        # 1. Create VPC with public/private subnets
         vpc = ec2.Vpc(
             self, "TravelAppVPC",
             max_azs=2,
@@ -28,19 +23,18 @@ class TravelAppInfraStack(Stack):
             ]
         )
 
-        # 3. Security Groups
-        # Frontend (React)
+        # 2. Security Groups
         frontend_sg = ec2.SecurityGroup(self, "FrontendSG", vpc=vpc)
-        frontend_sg.add_ingress_rule(ec2.Peer.ipv4(my_ip_cidr), ec2.Port.tcp(22), "SSH from my IP")
+        frontend_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(22), "SSH from anywhere")
         frontend_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "HTTP access")
         frontend_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(443), "HTTPS access")
 
-        # Backend (Spring Boot)
         backend_sg = ec2.SecurityGroup(self, "BackendSG", vpc=vpc)
+        backend_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(22), "SSH from anywhere")
+        backend_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(8080), "Public API access (testing)")
         backend_sg.add_ingress_rule(frontend_sg, ec2.Port.tcp(8080), "Allow API access from frontend")
 
-        # 4. EC2 Instances
-        # Frontend (React Docker)
+        # 3. EC2 Instances
         frontend = ec2.Instance(
             self, "FrontendInstance",
             instance_type=ec2.InstanceType("t2.micro"),
@@ -48,39 +42,63 @@ class TravelAppInfraStack(Stack):
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             security_group=frontend_sg,
-            key_name="TravelAppKey",  # ← REPLACE
-            user_data=ec2.UserData.custom(f"""#!/bin/bash
-                # Install Docker
+            key_name=key_name,
+            user_data=ec2.UserData.custom("""#!/bin/bash
                 yum update -y
-                yum install -y docker
-                systemctl start docker
+                yum install -y git
+                curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+                yum install -y nodejs
+                amazon-linux-extras install docker -y
+                sudo service docker start
                 usermod -aG docker ec2-user
-
-                # Run React app
-                docker run -d -p 80:80 -e REACT_APP_API_URL=http://$BACKEND_PRIVATE_IP:8080 react-app
+                amazon-linux-extras enable nginx1
+                yum clean metadata
+                yum install -y nginx
+                systemctl start nginx
+                systemctl enable nginx
+                cat > /etc/nginx/conf.d/frontend.conf << EOF
+                server {
+                    listen 80;
+                    server_name _;
+                    location / {
+                        proxy_pass http://localhost:3000;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade $http_upgrade;
+                        proxy_set_header Connection 'upgrade';
+                        proxy_set_header Host $host;
+                        proxy_cache_bypass $http_upgrade;
+                    }
+                }
+                EOF
+                systemctl restart nginx
+                # git clone <your-repo-url> /home/ec2-user/app
+                # cd /home/ec2-user/app
+                # npm install
+                # npm run build
+                # npm start
             """)
         )
 
-        # Backend (Spring Boot)
         backend = ec2.Instance(
             self, "BackendInstance",
             instance_type=ec2.InstanceType("t2.micro"),
             machine_image=ec2.MachineImage.latest_amazon_linux(),
             vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             security_group=backend_sg,
-            key_name="TravelAppKey",  # ← REPLACE
+            key_name=key_name,
             user_data=ec2.UserData.custom("""#!/bin/bash
-                # Install Java
+                yum update -y
                 yum install -y java-17-amazon-corretto
-
-                # Run Spring Boot (configure your DB connection manually)
-                nohup java -jar app.jar --server.port=8080 &
+                yum install -y mysql
+                amazon-linux-extras install docker -y
+                sudo service docker start
+                usermod -aG docker ec2-user
+                docker run hello-world
             """)
         )
 
         # 5. Outputs
         CfnOutput(self, "FrontendURL", value=f"http://{frontend.instance_public_ip}")
         CfnOutput(self, "BackendPrivateIP", value=backend.instance_private_ip)
-        CfnOutput(self, "SSHCommand",
-            value=f"ssh -i TravelAppKey.pem ec2-user@{frontend.instance_public_ip}")
+        CfnOutput(self, "SSHCommand", value=f"ssh -i {key_name}.pem ec2-user@{frontend.instance_public_ip}")
