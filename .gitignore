@@ -1,1 +1,5 @@
 TravelAppKey.pem
+.idea/
+.env
+node_modules/
+cdk.out
