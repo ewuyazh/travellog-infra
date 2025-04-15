@@ -1,127 +1,93 @@
 #!/bin/bash
-set -eo pipefail  # Strict error handling
-
-# ===== Configuration =====
-DEPLOY_ENV="production"
-APP_VERSION="1.0.0"
-DOCKER_IMAGE_NAME="travel-react-app"
-REACT_APP_NAME="react-app"
-SPRINGBOOT_SERVICE="app"  # Spring Boot container name
-GIT_HASH=$(git rev-parse --short HEAD)
-FRONTEND_DIR="../travellog-frontend"
-INFRA_DIR="."  # This script lives in infra repo
-
-AWS_EC2_HOST="3.87.242.127"
-AWS_EC2_USER="ec2-user"
-SSH_KEY="$(cd "$(dirname "$0")" && pwd)/TravelAppKey.pem"
-DOCKER_NETWORK="travel-global-network"
-NGINX_CONF="nginx.production.conf"
-COMPOSE_FILE="docker-compose.production.yml"
-
-cd "${FRONTEND_DIR}"
-
-# ===== Validate Environment =====
-if [ ! -f ".env.$DEPLOY_ENV" ]; then
-  echo "ERROR: .env.$DEPLOY_ENV not found!"
-  exit 1
-fi
-
-if [ ! -f "$COMPOSE_FILE" ]; then
-  echo "ERROR: $COMPOSE_FILE missing"
-  exit 1
-fi
-
-# ===== Prepare Deployment Package =====
-DEPLOY_PACKAGE="/tmp/deploy-$(date +%s).tar.gz"
-tar czf "$DEPLOY_PACKAGE" \
-  --exclude="$FRONTEND_DIR/node_modules" \
-  --exclude="$FRONTEND_DIR/.git" \
-  --exclude="$FRONTEND_DIR/*.log" \
-  --exclude="$FRONTEND_DIR/*.md" \
-  "$COMPOSE_FILE" \
-  ".env.$DEPLOY_ENV" \
-  Dockerfile.production \
-  "$FRONTEND_DIR"  # Include the source code (React app)
-
-# ===== Clean old tarballs on EC2 =====
-echo "=== Cleaning up old tarballs on EC2 ==="
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
-  "$AWS_EC2_USER@$AWS_EC2_HOST" \
-  "rm -f /tmp/deploy-*.tar.gz"
-
-# ===== Secure Transfer to EC2 =====
-cd "$INFRA_DIR"
-echo "=== Transferring to EC2 ==="
-scp -i "$SSH_KEY" -o StrictHostKeyChecking=no \
-  "$DEPLOY_PACKAGE" \
-  "$AWS_EC2_USER@$AWS_EC2_HOST:/tmp/"
-
-# ===== Remote Execution on EC2 =====
-ssh -i "$SSH_KEY" -T "$AWS_EC2_USER@$AWS_EC2_HOST" \
-  DEPLOY_PACKAGE="$DEPLOY_PACKAGE" DEPLOY_ENV="$DEPLOY_ENV" << 'EOSSH'
 set -eo pipefail
 
-DEPLOY_DIR="/home/ec2-user"
-TIMESTAMP=$(date +%Y%m%d%H%M%S)
-CURRENT_DIR="$DEPLOY_DIR/$TIMESTAMP"
+# === Input Arguments ===
+if [ -z "$1" ]; then
+  echo "Usage: ./deploy_frontend.sh <EC2_PUBLIC_IP>"
+  exit 1
+fi
+
+AWS_EC2_HOST="$1"
+AWS_EC2_USER="ec2-user"
+SSH_KEY="./TravelAppKey.pem"
 DEPLOY_ENV="production"
-COMPOSE_FILE="docker-compose.production.yml"
 
-echo "=== Setting Up Deployment ==="
-mkdir -p "$CURRENT_DIR"
-tar xzf /tmp/$DEPLOY_PACKAGE -C "$CURRENT_DIR"
-rm -f /tmp/deploy-*.tar.gz
+# === Paths ===
+FRONTEND_DIR="../travellog-frontend"
+DEPLOY_PACKAGE="/tmp/deploy-$(date +%s).tar.gz"
 
-echo "=== Loading Environment ==="
-export \$(grep -v '^#' "$CURRENT_DIR/.env.$DEPLOY_ENV" | xargs)
+echo "=== Starting Deployment Script ==="
+echo "==> Using EC2 Host: $AWS_EC2_HOST"
 
-# ===== Build React App and Docker Image on EC2 =====
-echo "=== Building React App and Docker Image on EC2 ==="
-cd "$CURRENT_DIR/$FRONTEND_DIR"
+# === Validate Frontend Directory ===
+echo "=== Navigating to frontend directory: $FRONTEND_DIR ==="
+cd "$FRONTEND_DIR"
 
-# Ensure Dockerfile is present
-if [ ! -f Dockerfile.production ]; then
-  echo "ERROR: Dockerfile.production not found!"
-  exit 1
-fi
+# === Validate Files ===
+echo "=== Validating required files ==="
+[ -f "vite.config.ts" ] || { echo "Missing vite.config.ts"; exit 1; }
+[ -f "package.json" ] || { echo "Missing package.json"; exit 1; }
 
-# Build the Docker image on EC2
-docker build -t "$DOCKER_IMAGE_NAME:$APP_VERSION" -f Dockerfile.production .
+# === Create Deployment Package ===
+echo "=== Preparing deployment package ==="
+echo "==> Creating tarball: $DEPLOY_PACKAGE"
+tar -czf "$DEPLOY_PACKAGE" . --exclude='node_modules' --exclude='build'
 
-# ===== Network Setup =====
-echo "=== Network Setup ==="
-docker network inspect travel-global-network >/dev/null 2>&1 || \
-  docker network create --driver bridge travel-global-network
+# === Clean up Old Tarballs on EC2 ===
+echo "=== Cleaning up old tarballs on EC2 ==="
+ssh -i "$SSH_KEY" "$AWS_EC2_USER@$AWS_EC2_HOST" "rm -f /tmp/deploy-*.tar.gz"
 
-echo "=== Deploying with Docker Compose ==="
-docker-compose -f "$CURRENT_DIR/$COMPOSE_FILE" up -d --no-deps react-app
+# === Return to Infra Directory ===
+cd - > /dev/null
 
-echo "=== Health Verification ==="
-for i in {1..10}; do
-  CONTAINER_ID=\$(docker ps -q -f name=react-app)
-  HEALTH=\$(docker inspect --format='{{.State.Health.Status}}' "\$CONTAINER_ID" 2>/dev/null || echo "starting")
-  [ "\$HEALTH" = "healthy" ] && break
-  sleep 5
-done
+# === Transfer Deployment Package ===
+echo "=== Transferring deployment package to EC2 ==="
+scp -i "$SSH_KEY" "$DEPLOY_PACKAGE" "$AWS_EC2_USER@$AWS_EC2_HOST:/tmp/"
 
-if [ "\$HEALTH" != "healthy" ]; then
-  echo "ERROR: Deployment failed health check"
-  docker logs "\$CONTAINER_ID"
-  exit 1
-fi
+# === Execute Deployment on EC2 ===
+echo "=== Executing deployment on EC2 ==="
+ssh -i "$SSH_KEY" -T "$AWS_EC2_USER@$AWS_EC2_HOST" <<EOSSH
+DEPLOY_PACKAGE="$DEPLOY_PACKAGE"
+DEPLOY_ENV="$DEPLOY_ENV"
+bash -s <<'INNERSCRIPT'
+set -eo pipefail
 
-echo "=== Cleaning Old Deployments ==="
-find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -type d -not -name "$TIMESTAMP" \
-  -exec rm -rf {} +
+LOG_DIR="/home/ec2-user/deploy-logs"
+LOGFILE="$LOG_DIR/deploy-$(date +%Y%m%d-%H%M%S).log"
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOGFILE") 2>&1
 
-echo "=== Current Services ==="
-docker-compose -f "$CURRENT_DIR/$COMPOSE_FILE" ps
+echo "=== Starting frontend deployment on EC2 ==="
+echo "DEPLOY_PACKAGE: \$DEPLOY_PACKAGE"
+echo "DEPLOY_ENV: \$DEPLOY_ENV"
+
+# === Unpack Package ===
+echo "=== Unpacking deployment package ==="
+mkdir -p /tmp/frontend-deploy
+rm -rf /tmp/frontend-deploy/*
+tar -xzf "\$DEPLOY_PACKAGE" -C /tmp/frontend-deploy
+
+cd /tmp/frontend-deploy || { echo "Unpack failed"; exit 1; }
+
+# === Install & Build ===
+echo "=== Installing frontend dependencies ==="
+npm ci
+
+echo "=== Building frontend ==="
+npm run build
+
+# === Deploy to Web Directory ===
+echo "=== Deploying to /var/www/html ==="
+sudo rm -rf /var/www/html/*
+sudo cp -r dist/* /var/www/html/
+
+echo "✅ Deployment to EC2 complete"
+echo "📝 Logs saved to \$LOGFILE"
+INNERSCRIPT
 EOSSH
 
-# ===== Local Cleanup =====
-echo "=== Cleaning Up Locally ==="
+# === Clean Up Local Tarball ===
+echo "=== Cleaning up local deployment package ==="
+rm -f "$DEPLOY_PACKAGE"
 
-# Remove deployment tarball
-rm -f "$INFRA_DIR/$DEPLOY_PACKAGE" || echo "Tarball already removed."
-
-echo "=== Local Cleanup Complete ==="
+echo "=== Deployment Complete! 🎉 ==="
